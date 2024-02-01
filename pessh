@@ -1,0 +1,233 @@
+#!/bin/bash
+
+# Copyright (c) 2024 Dinesh (2k2snid@gmail.com). All Rights Reserved.
+# This file is licensed under the MIT License (MIT). 
+# Please see LICENSE.txt (https://github.com/dins2k2/pessh) for more information.
+
+# pessh (Parallel Execution with SSH) is a robust and efficient SSH client toolkit 
+# designed for seamless execution of commands across a multitude of servers. With 
+# support for parallel execution, this toolkit enables the simultaneous processing 
+# of commands on hundreds of servers, optimizing efficiency in server management. 
+# pessh simplifies the process by utilizing username and password (encrypted) 
+# authentication, making it a versatile and user-friendly solution for executing 
+# commands across distributed server environments.
+
+# Utilized the GitHub repositories of passh (https://github.com/clarkwang/passh) and 
+# encpass.sh (https://github.com/plyint/encpass.sh) for enhanced functionality.
+# Refer to the specific repository for details regarding the license information.
+
+#    Usage: ./pessh -u <user> -e <encrpt_bucket_name> -f <host_list_file> -c <command_list_file>
+
+# Examples: ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh
+#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -d ~/output -a
+#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -d ~/output -a -w
+#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -s '-p 2122' -r 20 -w
+#           ./pessh -h
+#           ./pessh -v
+
+pesshDir=$(dirname $(readlink -f $0))
+
+# loading encpass.sh functions
+. "$pesshDir"/security/encpass.sh 
+
+SCRIPT_NAME=pessh
+SCRIPT_VERSION=v1.0
+SCRIPT_OWNER="Dinesh Kumar Selvamani"
+
+# Variables
+
+usr=
+bucket=
+tgtEncPwd=
+hosts=
+hostFilePath=
+cmdFilePath=
+outDir=$(dirname $(readlink -f $0))
+sshOpt="-q" # ssh in quiet mode
+rate=25
+aggOutFiles=false
+aggStdOut=false
+
+help() {
+  cat <<EOF
+
+Usage: $0 [options]... [arguments]...
+
+Options: ( * - mandatory options with arguments )
+
+  -u <user>      *remote system login name; alternative for -s '-l <user>'
+  -e <bucket>    *encrypted password bucket name. use ./security/encpass.sh script to add the bucket 
+                 and secret to protect the password exposing to others
+                 usage: ./security/encpass.sh add -f <bucket_name> secret 
+                 ( be sure the secret parameter should be named as 'secret' )
+                 eg: ./security/encpass.sh add -f personal secret 
+  -f <file>      *connect to hosts listed in file, one per line. pessh removes the duplicate host names.
+  -c <file>      *command(s) file path (contains the set of command(s) to be executed on the remote system)
+                 incude the respective (remote server) shell environment (ksh, bash, etc.) in the commands file 
+  -d <directory> output directory. each host output will be saved as the <outDir>/<host>.txt file
+                 ( default output dir: pessh script directory )
+  -r             connect rate in new SSH connections/sec ( default: 25 )
+  -s <options>   pass options to SSH, eg: -s '-p 2222'
+  -a             aggregates each host output and saves in a single file
+  -w             aggregates each host output and writes to the console
+                       
+  -h             display this help and exit
+  -v             display $SCRIPT_NAME version information and exit
+  
+EOF
+exit 0
+}
+
+version() {
+  echo "$SCRIPT_NAME $SCRIPT_VERSION"
+  exit 0
+}
+
+error() {
+  echo "$SCRIPT_NAME error: $*" >&2
+  exit 1
+}
+
+isHostFileEmpty() {
+  [ "$(grep -v '^#' $1 | wc -l)" -eq 0 ] && error "$1: Host list file is empty"
+}
+
+isFileExist() {
+  [ ! -f $1 ] && error "$1: No such file exists!"
+}
+
+isFileEmpty() {
+  awk 'NF {exit 1}' $1 && error "$1: File is empty!"
+}
+
+isDirectory() {
+  [ ! -d $1 ] && error "$1: No such directory exits!"
+}
+
+isDirAccessible() {
+  [ ! -r $1 ] || [ ! -w $1 ] || [ ! -x $1 ] && error "$1: Insufficient directory permission. rwx permissions required!"
+}
+
+aggHostOutput() {
+  export outDirExp=$outDir
+  xargs -a <(grep -v '^[[:space:]]*#' "$1") -I {} sh -c 'fn="{}.txt"; od="$outDirExp"; echo "----- $(basename "$fn" .txt) -----"; cat "$od/$fn"; echo ""'
+}
+
+while getopts ":hvawu:e:f:c:d:r:s:p:" opt; do
+    case "${opt}" in
+        u)
+            usr=${OPTARG}
+            sshOpt="$sshOpt -l $usr"
+            ;;
+        e)
+            bucket=${OPTARG}
+            tgtEncPwd="$(get_secret $bucket secret)"
+            ;;
+        f)
+            hostFilePath=${OPTARG}
+            sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//' $hostFilePath # remove leading and traling spaces and tabs if any
+            sort -u $hostFilePath -o $hostFilePath # remove duplicates if any
+            hosts="$hosts $(grep -v '^#' $hostFilePath)" # ignore commented (#) lines if any
+            ;;
+        c)
+            cmdFilePath=${OPTARG}
+            ;;
+        d)
+            outDir=$(echo "${OPTARG}" | sed 's/\/$//')
+            ;;
+        r)
+            rate=${OPTARG}
+            ;;
+        s)
+            sshOpt="$sshOpt ${OPTARG}"
+            ;;
+        a)
+            aggOutFiles=true
+            ;;
+        w)
+            aggStdOut=true
+            ;;
+        h)
+            help
+            ;;
+        v)
+            version
+            ;;
+        :) 
+            error "-$OPTARG requires an argument" 
+            ;;
+        *)
+            error "unknown option '$@'"
+            ;;
+    esac
+done
+shift "$((OPTIND-1))"
+
+# To check the mandatory script options with arguments are passed?
+if [ ! "$usr" ] || [ ! "$bucket" ] || [ ! "$hostFilePath" ] || [ ! "$cmdFilePath" ]; then
+  error "mandatory options -u, -e, -f, -c with arguments must be provided"
+fi
+
+isFileExist "$hostFilePath"
+isHostFileEmpty "$hostFilePath"
+isFileExist "$cmdFilePath"
+isFileEmpty "$cmdFilePath"
+isDirectory "$outDir"
+isDirAccessible "$outDir"
+
+if [ "$rate" -gt 0 ]; then
+  delay=$(printf ".%03d" $((1000 / rate)))
+fi
+
+perr=$(cat "$cmdFilePath" 2>&1 >/dev/null)
+if [ -n "$perr" ]; then
+  error "$perr"
+fi
+plen=$(stat -c%s "$cmdFilePath")
+rtmp=/tmp/remote-$(basename "$cmdFilePath")-$$
+
+t0=$(date +%s)
+
+for host in $hosts; do
+  export host # for parallel execution
+  (
+    host=$(echo $host | tr -d '\t')
+    ping -c1 -W1 -q $host &>/dev/null
+    status=$( echo $? )
+    if [[ $status == 0 ]] ; then # only if the host is reachable
+      # scp the commands file to the remote server
+      $pesshDir/bin/passh -q -y yes -p $tgtEncPwd scp -q $cmdFilePath $usr@$host:$rtmp | sed '1d' 2>&1
+      # execute the remote commands file and removes it
+      $pesshDir/bin/passh -q -y yes -p $tgtEncPwd ssh $sshOpt $host "chmod +x $rtmp && $rtmp; e=\$?; rm $rtmp; exit \$e" | sed '1{/^[[:space:]]*$/d;}' > $outDir/$host.txt
+    else
+      echo "$host Unreachable" > $outDir/$host.txt
+    fi
+  ) &
+  sleep "$delay"
+done
+
+wait
+
+t1=$(date +%s)
+dt=$((t1 - t0))
+hcount=$(echo "$hosts" | grep -v '^[[:space:]]*#' | grep -c '^')
+echo "Total Hosts: $hcount | Elapsed Time: $dt second(s)" >&2
+
+if [ "$aggOutFiles" = true ]; then
+  aggOutPath=$outDir/pessh-agg-out-$$.txt
+  aggHostOutput "$hostFilePath" > $aggOutPath
+  echo "Aggregated output saved as $(readlink -f $aggOutPath)"
+  if [ "$aggStdOut" = true ]; then
+    echo ""
+    cat $aggOutPath
+    aggStdOut=false
+  fi  
+fi
+
+if [ "$aggStdOut" = true ]; then
+  export outDirExp=$outDir
+  echo ""
+  aggHostOutput "$hostFilePath"
+fi
+
+# end of the script
