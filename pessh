@@ -16,56 +16,66 @@
 # encpass.sh (https://github.com/plyint/encpass.sh) for enhanced functionality.
 # Refer to the specific repository for details regarding the license information.
 
-#    Usage: ./pessh -u <user> -e <encrpt_bucket_name> -f <host_list_file> -c <command_list_file>
+#    Usage: ./pessh -u <user> [ -U ] -e <encrpt_bucket_name> -f <host_list_file> -c <command_list_file>
 
-# Examples: ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh
-#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -d ~/output -a
-#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -d ~/output -a -w
-#           ./pessh -u user1 -e personal -f ~/hosts.txt -c ~/commands.sh -s '-p 2122' -r 20 -w
+# Examples: ./pessh -u user1 -e personal -f ./input/hosts.txt -c ./input/commands.sh
+#           ./pessh -U -f ./input/hosts.txt -c ./input/commands.sh
+#           ./pessh -u user1 -e personal -f ./input/hosts.txt -c ./input/commands.sh -d ./output -a
+#           ./pessh -u user1 -e personal -f ./input/hosts.txt -c ./input/commands.sh -d ./output -a -w
+#           ./pessh -u user1 -e personal -f ./input/hosts.txt -c ./input/commands.sh -s '-p 2122' -r 20
 #           ./pessh -h
 #           ./pessh -v
 
 pesshDir=$(dirname $(readlink -f $0))
 
-# loading encpass.sh functions
+# Loading encpass.sh functions
 . "$pesshDir"/security/encpass.sh 
+#
 
 SCRIPT_NAME=pessh
-SCRIPT_VERSION=v1.0
+SCRIPT_VERSION=v1.1
 SCRIPT_OWNER="Dinesh Kumar Selvamani"
 
 # Variables
-
 usr=
 bucket=
 tgtEncPwd=
+sudoUserArg=
+sudoPwdLessFlag=false
 hosts=
 hostFilePath=
 cmdFilePath=
-outDir=$(dirname $(readlink -f $0))
+outDir=$pesshDir/output
 sshOpt="-q" # ssh in quiet mode
 rate=25
 aggOutFiles=false
 aggStdOut=false
+secretsDir="$pesshDir"/security/.encpass/secrets/
+#
 
 help() {
   cat <<EOF
 
 Usage: $0 [options]... [arguments]...
 
-Options: ( * - mandatory options with arguments )
+Options: ( * - mandatory option with argument )
 
-  -u <user>      *remote system login name; alternative for -s '-l <user>'
-  -e <bucket>    *encrypted password bucket name. use ./security/encpass.sh script to add the bucket 
-                 and secret to protect the password exposing to others
+  -u <user>      *remote server user name; alternative for -s '-l <user>'
+                 ignore this when -U option is used
+  -U             *for running as root or sudo user
+                 when the -U option is used, the -u and -e options can be ignored as they are superseded by -U 
+                 assuming passwordless ssh has been setup for root/sudo user, otherwise use -u and -e options
+  -e <bucket>    *encrypted password bucket name, ignore this when -U option is used
+                 use ./security/encpass.sh script to add a bucket and secret 
+                 to protect the remote server user password exposing to others
                  usage: ./security/encpass.sh add -f <bucket_name> secret 
                  ( be sure the secret parameter should be named as 'secret' )
-                 eg: ./security/encpass.sh add -f personal secret 
+                 eg: ./security/encpass.sh add -f personal secret
   -f <file>      *connect to hosts listed in file, one per line. pessh removes the duplicate host names.
-  -c <file>      *command(s) file path (contains the set of command(s) to be executed on the remote system)
+  -c <file>      *commands file path (contains the set of command(s) to be executed on the remote system)
                  incude the respective (remote server) shell environment (ksh, bash, etc.) in the commands file 
   -d <directory> output directory. each host output will be saved as the <outDir>/<host>.txt file
-                 ( default output dir: pessh script directory )
+                 ( default output dir: $pesshDir/output )
   -r             connect rate in new SSH connections/sec ( default: 25 )
   -s <options>   pass options to SSH, eg: -s '-p 2222'
   -a             aggregates each host output and saves in a single file
@@ -88,6 +98,36 @@ error() {
   exit 1
 }
 
+# Function to check if the mandatory option is specified or not
+checkMandOpt() {
+opt1=$1
+arg1=$2
+if [ "x" == "x$arg1" ]; then
+  error "Mandatory option $opt1 <argument> is missing!"
+fi
+}
+#
+
+# Function to check if an option argument is specified or not
+checkOptArg() {
+opt2=$1
+optVal=$2
+if [ -z "$optVal" -o "${optVal:0:1}" = "-" ] ; then
+  error "Option $opt2 requires an argument!"
+fi
+}
+#
+
+# Function to check if the encpass bucket exists or not
+checkBucketExist() {
+bdir=$(find $secretsDir -type d -name "$1")
+if [ -z "$bdir" ] ; then
+  echo "pessh error: Bucket name '$1' doesn't exist for -e option! please check below the usage to create encrypted password bucket."
+  help
+fi
+}
+#
+
 isHostFileEmpty() {
   [ "$(grep -v '^#' $1 | wc -l)" -eq 0 ] && error "$1: Host list file is empty"
 }
@@ -108,28 +148,33 @@ isDirAccessible() {
   [ ! -r $1 ] || [ ! -w $1 ] || [ ! -x $1 ] && error "$1: Insufficient directory permission. rwx permissions required!"
 }
 
+# Function to aggregate the host(s) output
 aggHostOutput() {
   export outDirExp=$outDir
   xargs -a <(grep -v '^[[:space:]]*#' "$1") -I {} sh -c 'fn="{}.txt"; od="$outDirExp"; echo "----- $(basename "$fn" .txt) -----"; cat "$od/$fn"; echo ""'
 }
 
-while getopts ":hvawu:e:f:c:d:r:s:p:" opt; do
+while getopts ":hvawUu:e:f:c:d:r:s:p:" opt; do
     case "${opt}" in
         u)
             usr=${OPTARG}
             sshOpt="$sshOpt -l $usr"
             ;;
+        U)
+            sudoPwdLessFlag=true
+            ;;
         e)
             bucket=${OPTARG}
-            tgtEncPwd="$(get_secret $bucket secret)"
             ;;
         f)
+            checkOptArg "-f" "$OPTARG"
             hostFilePath=${OPTARG}
             sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//' $hostFilePath # remove leading and traling spaces and tabs if any
             sort -u $hostFilePath -o $hostFilePath # remove duplicates if any
             hosts="$hosts $(grep -v '^#' $hostFilePath)" # ignore commented (#) lines if any
             ;;
         c)
+            checkOptArg "-c" "$OPTARG"
             cmdFilePath=${OPTARG}
             ;;
         d)
@@ -139,6 +184,7 @@ while getopts ":hvawu:e:f:c:d:r:s:p:" opt; do
             rate=${OPTARG}
             ;;
         s)
+            checkOptArg "-s" "'$OPTARG'"
             sshOpt="$sshOpt ${OPTARG}"
             ;;
         a)
@@ -154,65 +200,103 @@ while getopts ":hvawu:e:f:c:d:r:s:p:" opt; do
             version
             ;;
         :) 
-            error "-$OPTARG requires an argument" 
+            error "-$OPTARG requires an argument"
             ;;
-        *)
-            error "unknown option '$@'"
+        \?)
+            error "unknown option '-$OPTARG'"
             ;;
     esac
 done
-shift "$((OPTIND-1))"
 
-# To check the mandatory script options with arguments are passed?
-if [ ! "$usr" ] || [ ! "$bucket" ] || [ ! "$hostFilePath" ] || [ ! "$cmdFilePath" ]; then
-  error "mandatory options -u, -e, -f, -c with arguments must be provided"
+if ((OPTIND == 1))
+then
+    error "No options specified!"
+    help
 fi
 
+shift "$((OPTIND-1))"
+
+# To check the mandatory script options are specified?
+if $sudoPwdLessFlag; then
+  [ "x" != "x$sudoUserArg" ] && error "-U option doesn't take an argument!"
+  if [ "${EUID:-0}" -eq 0 ] || [ "$(id -u)" -eq 0 ]; then
+    usr="root"
+    sshOpt="$sshOpt -l $usr"
+  else
+    error "Given the -U option is in use, the script must be executed with root or sudo user privileges."
+  fi
+else
+  checkMandOpt "-u" "$usr"
+  checkOptArg "-u" "$usr"
+  checkMandOpt "-e" "$bucket"
+  checkOptArg "-e" "$bucket"
+  checkBucketExist "$bucket"
+  tgtEncPwd="$(get_secret $bucket secret)"
+fi
+checkMandOpt "-f" "$hostFilePath"
+checkMandOpt "-c" "$cmdFilePath"
+#
+
+# To check the given input file or directory status
 isFileExist "$hostFilePath"
 isHostFileEmpty "$hostFilePath"
 isFileExist "$cmdFilePath"
 isFileEmpty "$cmdFilePath"
 isDirectory "$outDir"
 isDirAccessible "$outDir"
+#
 
+# To calculate delay in milliseconds between operations. Default rate (number of parallel tasks per second) is 25.
 if [ "$rate" -gt 0 ]; then
   delay=$(printf ".%03d" $((1000 / rate)))
 fi
+#
 
 perr=$(cat "$cmdFilePath" 2>&1 >/dev/null)
 if [ -n "$perr" ]; then
   error "$perr"
 fi
 plen=$(stat -c%s "$cmdFilePath")
-rtmp=/tmp/remote-$(basename "$cmdFilePath")-$$
+rtmp=/tmp/remote-$(basename "$cmdFilePath")-$$ # remote commands temporary file name
 
-t0=$(date +%s)
+if $sudoPwdLessFlag; then
+  echo "Running as 'root' user. Ignoring -u and -e options if specified."
+fi
+
+t0=$(date +%s) # parallel execution start time
 
 for host in $hosts; do
+# For each host, it exports the host variable to the environment of the subshell that will execute the commands. This is done to ensure that the host variable is available to the commands executed in parallel.
   export host # for parallel execution
   (
     host=$(echo $host | tr -d '\t')
     ping -c1 -W1 -q $host &>/dev/null
     status=$( echo $? )
     if [[ $status == 0 ]] ; then # only if the host is reachable
-      # scp the commands file to the remote server
-      $pesshDir/bin/passh -q -y yes -p $tgtEncPwd scp -q $cmdFilePath $usr@$host:$rtmp | sed '1d' 2>&1
-      # execute the remote commands file and removes it
-      $pesshDir/bin/passh -q -y yes -p $tgtEncPwd ssh $sshOpt $host "chmod +x $rtmp && $rtmp; e=\$?; rm $rtmp; exit \$e" | sed '1{/^[[:space:]]*$/d;}' > $outDir/$host.txt
+      if [ "$sudoPwdLessFlag" = true ]; then
+        # scp the commands file to the remote server /tmp directory
+        $pesshDir/bin/passh -q -y yes scp -q $cmdFilePath $usr@$host:$rtmp | sed '1d' 2>&1
+        # execute the remote commands file and removes it
+        $pesshDir/bin/passh -q -y yes ssh $sshOpt $host "chmod +x $rtmp && $rtmp; e=\$?; rm $rtmp; exit \$e" | sed '1{/^[[:space:]]*$/d;}' > $outDir/$host.txt
+      else
+        $pesshDir/bin/passh -q -y yes -p $tgtEncPwd scp -q $cmdFilePath $usr@$host:$rtmp | sed '1d' 2>&1
+        $pesshDir/bin/passh -q -y yes -p $tgtEncPwd ssh $sshOpt $host "chmod +x $rtmp && $rtmp; e=\$?; rm $rtmp; exit \$e" | sed '1{/^[[:space:]]*$/d;}' > $outDir/$host.txt
+      fi
     else
       echo "$host Unreachable" > $outDir/$host.txt
     fi
   ) &
-  sleep "$delay"
+  sleep "$delay" # after starting the background process for a host, the script waits for the duration specified in the $delay variable before proceeding to the next host.
 done
 
-wait
+wait # wait for all background processes to complete
 
-t1=$(date +%s)
-dt=$((t1 - t0))
-hcount=$(echo "$hosts" | grep -v '^[[:space:]]*#' | grep -c '^')
+t1=$(date +%s) # parallel execution end time
+dt=$((t1 - t0)) # elapsed time in seconds
+hcount=$(echo "$hosts" | grep -v '^[[:space:]]*#' | grep -c '^') # total host count
 echo "Total Hosts: $hcount | Elapsed Time: $dt second(s)" >&2
 
+# To aggregate the all the host(s) output to a single file
 if [ "$aggOutFiles" = true ]; then
   aggOutPath=$outDir/pessh-agg-out-$$.txt
   aggHostOutput "$hostFilePath" > $aggOutPath
@@ -223,11 +307,14 @@ if [ "$aggOutFiles" = true ]; then
     aggStdOut=false
   fi  
 fi
+#
 
+# To print the each host(s) to the console
 if [ "$aggStdOut" = true ]; then
   export outDirExp=$outDir
   echo ""
   aggHostOutput "$hostFilePath"
 fi
+#
 
 # end of the script
