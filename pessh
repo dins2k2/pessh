@@ -260,7 +260,7 @@ plen=$(stat -c%s "$cmdFilePath")
 rtmp=/tmp/remote-$(basename "$cmdFilePath")-$$ # remote commands temporary file name
 
 if $sudoPwdLessFlag; then
-  echo "Running as 'root' user. Ignoring -u and -e options if specified."
+  echo "Running as '$(whoami)' user. Ignoring -u and -e options if specified."
 fi
 
 t0=$(date +%s) # parallel execution start time
